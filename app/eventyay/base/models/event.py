@@ -1,20 +1,18 @@
 import copy
 import datetime as dt
+import logging
 import os
 import string
 import uuid
 from collections import OrderedDict, defaultdict
 from contextlib import suppress
-from urllib.parse import urlparse
 from datetime import datetime, time, timedelta
 from operator import attrgetter
-from typing import List
 from urllib.parse import urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 import icalendar
 import jwt
-import logging
 from dateutil.relativedelta import relativedelta
 from django.conf import settings
 from django.core.exceptions import MultipleObjectsReturned, ValidationError
@@ -45,17 +43,25 @@ from rules.contrib.models import RulesModelBase, RulesModelMixin
 from eventyay.base.models.base import LoggedModel
 from eventyay.base.models.fields import MultiStringField
 from eventyay.base.models.mixins import FileCleanupMixin, TimestampedModel
+from eventyay.base.plugins import get_all_plugins
 from eventyay.base.reldate import RelativeDateWrapper
 from eventyay.base.settings import GlobalSettingsObject
 from eventyay.base.validators import EventSlugBanlistValidator
 from eventyay.common.language import LANGUAGE_NAMES
-from eventyay.base.plugins import get_all_plugins
 from eventyay.common.text.path import path_with_hash
 from eventyay.common.text.phrases import phrases
 from eventyay.common.urls import EventUrls
 from eventyay.consts import TIMEZONE_CHOICES
-from eventyay.core.permissions import MAX_PERMISSIONS_IF_SILENCED, SYSTEM_ROLES, Permission
+from eventyay.core.permissions import (
+    MAX_PERMISSIONS_IF_SILENCED,
+    ORGANIZER_ROLES,
+    SYSTEM_ROLES,
+    Permission,
+    normalize_permission_value,
+    traits_match_required,
+)
 from eventyay.core.utils.json import CustomJSONEncoder
+from eventyay.eventyay_common.video.permissions import VIDEO_PERMISSION_BY_FIELD, VIDEO_TRAIT_ROLE_MAP
 from eventyay.helpers.database import GroupConcat
 from eventyay.helpers.daterange import daterange
 from eventyay.helpers.json import safe_string
@@ -90,7 +96,6 @@ def default_roles():
     attendee = [
         Permission.EVENT_VIEW,
         Permission.EVENT_EXHIBITION_CONTACT,
-        Permission.EVENT_CHAT_DIRECT,
     ]
     viewer = attendee + [Permission.ROOM_VIEW, Permission.ROOM_CHAT_READ]
     participant = viewer + [
@@ -163,7 +168,7 @@ def default_grants():
     return {
         'attendee': ['attendee'],
         'admin': ['admin'],
-        'scheduleuser': ['schedule-update'],
+        'scheduleuser': [],
     }
 
 
@@ -525,6 +530,8 @@ class Event(
     :type organizer: eventyay.base.models.organizer.Organizer
     :param testmode: This event is in test mode
     :type testmode: bool
+    :param private_testmode: This event hides tickets from non-organizers
+    :type private_testmode: bool
     :param name: This event's full title
     :type name: str
     :param slug: A short, alphanumeric, all-lowercase name for use in URLs. The slug has to
@@ -535,13 +542,13 @@ class Event(
     :param currency: The currency of all prices and payments of this event
     :type currency: str
     :param date_from: The datetime this event starts
-    :type date_from: datetime
+    :type date_from: datetime.datetime
     :param date_to: The datetime this event ends
-    :type date_to: datetime
+    :type date_to: datetime.datetime
     :param presale_start: No tickets will be sold before this date.
-    :type presale_start: datetime
+    :type presale_start: datetime.datetime
     :param presale_end: No tickets will be sold after this date.
-    :type presale_end: datetime
+    :type presale_end: datetime.datetime
     :param location: venue
     :type location: str
     :param plugins: A comma-separated list of plugin names that are active for this
@@ -558,6 +565,7 @@ class Event(
     CURRENCY_CHOICES = [(c.alpha_3, c.alpha_3 + ' - ' + c.name) for c in settings.CURRENCIES]
     organizer = models.ForeignKey(Organizer, related_name='events', on_delete=models.PROTECT)
     testmode = models.BooleanField(default=False)
+    private_testmode = models.BooleanField(default=True)
     name = I18nCharField(
         max_length=200,
         verbose_name=_('Event name'),
@@ -584,6 +592,10 @@ class Event(
         verbose_name=_('Short form'),
     )
     live = models.BooleanField(default=False, verbose_name=_('Shop is live'))
+    startpage_visible = models.BooleanField(default=True, verbose_name=_('Visible on start page'))
+    startpage_featured = models.BooleanField(default=False, verbose_name=_('Featured on start page'))
+    tickets_published = models.BooleanField(default=False, verbose_name=_('Tickets are published'))
+    talks_published = models.BooleanField(default=False, verbose_name=_('Talk pages are published'))
     currency = models.CharField(
         max_length=10,
         verbose_name=_('Event currency'),
@@ -729,16 +741,6 @@ class Event(
         choices=settings.LANGUAGES,
         verbose_name=_('Default language'),
     )
-    landing_page_text = I18nTextField(
-        verbose_name=_('Landing page text'),
-        help_text=_(
-            'This text will be shown on the landing page, alongside with links to the CfP and schedule, if appropriate.'
-        )
-        + ' '
-        + phrases.base.use_markdown,
-        null=True,
-        blank=True,
-    )
     featured_sessions_text = I18nTextField(
         verbose_name=_('Featured sessions text'),
         help_text=_('This text will be shown at the top of the featured sessions page instead of the default text.')
@@ -861,7 +863,7 @@ class Event(
         """URL patterns for API endpoints related to this event."""
 
         base_path = settings.TALK_BASE_PATH
-        base = '{base_path}/api/events/{self.slug}/'
+        base = '{base_path}/api/v1/events/{self.slug}/'
         submissions = '{base}submissions/'
         slots = '{base}slots/'
         talks = '{base}talks/'
@@ -921,6 +923,9 @@ class Event(
         self.settings.event_list_type = 'calendar'
         self.settings.invoice_email_attachment = True
         self.settings.name_scheme = 'given_family'
+        self.settings.ticket_download = True
+        self.settings.private_testmode_tickets = True
+        self.settings.private_testmode_talks = True
 
     @property
     def social_image(self):
@@ -1110,6 +1115,9 @@ class Event(
         if other.date_admission:
             self.date_admission = self.date_from + (other.date_admission - other.date_from)
         self.testmode = other.testmode
+        self.private_testmode = other.private_testmode
+        self.tickets_published = other.tickets_published
+        self.talks_published = other.talks_published
         self.save()
         self.log_action('eventyay.object.cloned', data={'source': other.slug, 'source_id': other.pk})
 
@@ -1356,38 +1364,73 @@ class Event(
         if exc and allow_raise:
             raise exc
 
+    def _get_trait_grants_with_defaults(self):
+        base_trait_grants = self.trait_grants if self.trait_grants is not None else default_grants()
+        slug = getattr(self, "slug", None) or getattr(self, "id", None)
+        if not slug:
+            return base_trait_grants
+        augmented = dict(base_trait_grants)
+        for role, trait_name in VIDEO_TRAIT_ROLE_MAP.items():
+            augmented.setdefault(role, [f"eventyay-video-event-{slug}-{trait_name.replace('_', '-')}"])
+        return augmented
+
+    def _remove_direct_messaging_if_unauthorized(self, result, user_traits):
+        """Remove EVENT_CHAT_DIRECT permission if user doesn't have the direct messaging trait.
+
+        Args:
+            result: Permission result dictionary to modify
+            user_traits: List of user traits
+        """
+        direct_messaging_def = VIDEO_PERMISSION_BY_FIELD.get('can_video_direct_message')
+        if not direct_messaging_def:
+            return
+
+        direct_messaging_trait = direct_messaging_def.trait_value(self.slug)
+        has_direct_messaging_trait = direct_messaging_trait in user_traits
+
+        if not has_direct_messaging_trait:
+            direct_message_value = Permission.EVENT_CHAT_DIRECT.value
+            result[self] = {
+                p for p in result[self]
+                if normalize_permission_value(p) != direct_message_value
+            }
+
     def has_permission_implicit(
         self,
         *,
         traits,
-        permissions: List[Permission],
+        permissions: list[Permission],
         room=None,
         allow_empty_traits=True,
     ):
         # Ensure trait_grants and roles are not None - use defaults if missing
-        event_trait_grants = self.trait_grants if self.trait_grants is not None else default_grants()
+        event_trait_grants = self._get_trait_grants_with_defaults()
         event_roles = self.roles if self.roles is not None else default_roles()
 
         for role, required_traits in event_trait_grants.items():
             if (
-                isinstance(required_traits, list)
-                and all(any(x in traits for x in (r if isinstance(r, list) else [r])) for r in required_traits)
+                traits_match_required(traits, required_traits)
                 and (required_traits or allow_empty_traits)
             ):
                 role_permissions = event_roles.get(role, SYSTEM_ROLES.get(role, []))
-                if any(p in role_permissions or p.value in role_permissions for p in permissions):
+                if any(
+                    normalize_permission_value(p) in role_permissions
+                    for p in permissions
+                ):
                     return True
 
         if room:
             room_trait_grants = room.trait_grants if room.trait_grants is not None else {}
             for role, required_traits in room_trait_grants.items():
                 if (
-                    isinstance(required_traits, list)
-                    and all(any(x in traits for x in (r if isinstance(r, list) else [r])) for r in required_traits)
+                    traits_match_required(traits, required_traits)
                     and (required_traits or allow_empty_traits)
                 ):
                     role_permissions = event_roles.get(role, SYSTEM_ROLES.get(role, []))
-                    if any(p in role_permissions or p.value in role_permissions for p in permissions):
+                    if any(
+                        normalize_permission_value(p) in role_permissions
+                        for p in permissions
+                    ):
                         return True
 
         # Return False if no permission was granted
@@ -1409,7 +1452,7 @@ class Event(
             return False
 
         if self.has_permission_implicit(
-            traits=user.traits,
+            traits=user.traits or [],
             permissions=permission,
             room=room,
             allow_empty_traits=user.type == User.UserType.PERSON,
@@ -1419,7 +1462,8 @@ class Event(
         roles = user.get_role_grants(room)
         event_roles = self.roles if self.roles is not None else default_roles()
         for r in roles:
-            if any(p.value in event_roles.get(r, SYSTEM_ROLES.get(r, [])) for p in permission):
+            role_perms = event_roles.get(r, SYSTEM_ROLES.get(r, []))
+            if any(normalize_permission_value(p) in role_perms for p in permission):
                 return True
 
     async def has_permission_async(self, *, user, permission: Permission, room=None):
@@ -1438,7 +1482,7 @@ class Event(
             return False
 
         if self.has_permission_implicit(
-            traits=user.traits,
+            traits=user.traits or [],
             permissions=permission,
             room=room,
             allow_empty_traits=user.type == User.UserType.PERSON,
@@ -1448,7 +1492,8 @@ class Event(
         roles = await user.get_role_grants_async(room)
         event_roles = self.roles if self.roles is not None else default_roles()
         for r in roles:
-            if any(p.value in event_roles.get(r, SYSTEM_ROLES.get(r, [])) for p in permission):
+            role_perms = event_roles.get(r, SYSTEM_ROLES.get(r, []))
+            if any(normalize_permission_value(p) in role_perms for p in permission):
                 return True
 
     def get_all_permissions(self, user):
@@ -1459,25 +1504,38 @@ class Event(
         allow_empty_traits = user.type == User.UserType.PERSON
 
         # Ensure trait_grants and roles are not None
-        event_trait_grants = self.trait_grants if self.trait_grants is not None else default_grants()
+        event_trait_grants = self._get_trait_grants_with_defaults()
         event_roles = self.roles if self.roles is not None else default_roles()
+
+        user_traits = user.traits or []
 
         for role, required_traits in event_trait_grants.items():
             if (
-                isinstance(required_traits, list)
-                and all(any(x in user.traits for x in (r if isinstance(r, list) else [r])) for r in required_traits)
+                traits_match_required(user_traits, required_traits)
                 and (required_traits or allow_empty_traits)
             ):
-                result[self].update(event_roles.get(role, SYSTEM_ROLES.get(role, [])))
+                role_perms = event_roles.get(role, SYSTEM_ROLES.get(role, []))
+                result[self].update(role_perms)
 
-        # Removed user.world_grants loop (attribute not present on unified User model)
+        # Admin mode in the ticket/talk system is represented by the ``admin`` trait on the video side.
+        # When admin mode is ON, the user has the ``admin`` trait and should retain full access.
+        admin_mode_active = "admin" in user_traits
+
+        if admin_mode_active:
+            # Grant all video manager permissions when admin mode is active
+            for role_name in ORGANIZER_ROLES:
+                role_perms = event_roles.get(role_name, SYSTEM_ROLES.get(role_name, []))
+                result[self].update(role_perms)
+        else:
+            # Remove EVENT_CHAT_DIRECT from ALL users unless they have the direct messaging trait.
+            # Only users with can_video_direct_message team permission get the video_direct_messaging trait.
+            self._remove_direct_messaging_if_unauthorized(result, user_traits)
 
         for room in self.rooms.all():
             room_trait_grants = room.trait_grants if room.trait_grants is not None else {}
             for role, required_traits in room_trait_grants.items():
                 if (
-                    isinstance(required_traits, list)
-                    and all(any(x in user.traits for x in (r if isinstance(r, list) else [r])) for r in required_traits)
+                    traits_match_required(user_traits, required_traits)
                     and (required_traits or allow_empty_traits)
                 ):
                     result[room].update(event_roles.get(role, SYSTEM_ROLES.get(role, [])))
@@ -1808,6 +1866,42 @@ class Event(
         return result
 
     @property
+    def talks_testmode(self):
+        return self.settings.get('talks_testmode', False, as_type=bool)
+
+    @property
+    def has_component_testmode(self):
+        return bool(self.testmode or self.talks_testmode)
+
+    def user_can_view_tickets(self, user=None, request=None):
+        private_tickets = self.private_testmode and self.settings.get(
+            'private_testmode_tickets', True, as_type=bool
+        )
+        if not self.tickets_published and not private_tickets:
+            return False
+        if not private_tickets:
+            return True
+        if not user or not getattr(user, 'is_authenticated', False):
+            return False
+        if getattr(user, 'is_administrator', False):
+            return True
+        return user.has_event_permission(self.organizer, self, request=request)
+
+    def user_can_view_talks(self, user=None, request=None):
+        private_talks = self.private_testmode and self.settings.get(
+            'private_testmode_talks', False, as_type=bool
+        )
+        if not self.talks_published and not private_talks:
+            return False
+        if not private_talks:
+            return True
+        if not user or not getattr(user, 'is_authenticated', False):
+            return False
+        if getattr(user, 'is_administrator', False):
+            return True
+        return user.has_event_permission(self.organizer, self, request=request)
+
+    @property
     def has_paid_things(self):
         from .product import Product, ProductVariation
 
@@ -1830,13 +1924,11 @@ class Event(
 
     @property
     def talk_dashboard_url(self):
-        url = urljoin(TALK_HOSTNAME, f'orga/event/{self.slug}')
-        return url
+        return reverse('orga:event.dashboard', kwargs={'event': self.slug})
 
     @property
     def talk_settings_url(self):
-        url = urljoin(TALK_HOSTNAME, f'orga/event/{self.slug}/settings')
-        return url
+        return reverse('orga:settings.event.view', kwargs={'event': self.slug})
 
     @cached_property
     def live_issues(self):
@@ -1847,7 +1939,7 @@ class Event(
         if self.has_paid_things and not self.has_payment_provider:
             issues.append(_('You have configured at least one paid product but have not enabled any payment methods.'))
 
-        if not self.quotas.exists():
+        if self.products.exists() and not self.quotas.exists():
             issues.append(_('You need to configure at least one quota to sell anything.'))
 
         if self.organizer.has_unpaid_invoice():
@@ -1872,26 +1964,40 @@ class Event(
                     )
                 )
 
-        gs = GlobalSettingsObject()
-        if gs.settings.get('billing_validation', 'True') == 'True':
-            billing_obj = OrganizerBillingModel.objects.filter(organizer=self.organizer).first()
-            if not billing_obj or not billing_obj.stripe_payment_method_id:
-                url = reverse(
-                    'control:organizer.settings.billing',
-                    kwargs={'organizer': self.organizer.slug},
-                )
-                issue = format_html(
-                    '<a href="{}#tab-0-1-open">{}</a>',
-                    url,
-                    gettext('You need to fill the billing information.'),
-                )
-                issues.append(issue)
+        issues.extend(self.billing_issues())
 
         responses = event_live_issues.send(self)
         for receiver, response in sorted(responses, key=lambda r: str(r[0])):
             if response:
                 issues.append(response)
 
+        return issues
+
+    def billing_issues(self):
+        from django.utils.html import format_html
+        from django.utils.translation import gettext
+
+        from eventyay.base.models.organizer import OrganizerBillingModel
+        from eventyay.base.settings import GlobalSettingsObject
+
+        issues = []
+        gs = GlobalSettingsObject()
+        billing_validation_enabled = gs.settings.get('billing_validation', as_type=bool, default=True)
+        if not billing_validation_enabled:
+            return issues
+
+        billing_obj = OrganizerBillingModel.objects.filter(organizer=self.organizer).first()
+        if not billing_obj or not billing_obj.stripe_payment_method_id:
+            url = reverse(
+                'eventyay_common:organizer.billing',
+                kwargs={'organizer': self.organizer.slug},
+            )
+            issue = format_html(
+                '<a href="{}#tab-0-1-open">{}</a>',
+                url,
+                gettext('You need to fill the billing information.'),
+            )
+            issues.append(issue)
         return issues
 
     def get_users_with_any_permission(self):
@@ -2153,8 +2259,12 @@ class Event(
     @cached_property
     def _visible_logo_path(self):
         """
-        Resolve a usable logo path/URL from common settings (event_logo_image/logo_image).
+        Resolve a usable logo path/URL from event_logo_image setting.
         Returns a storage-relative path (e.g. ``pub/...``) or an absolute URL.
+
+        NOTE: This method ONLY checks for event_logo_image, NOT logo_image.
+        The logo_image setting is actually used for HEADER images (see default_setting.py),
+        so we must NOT use it here to prevent header images from appearing as logos.
         """
         def _extract_path(obj):
             if not obj:
@@ -2167,7 +2277,8 @@ class Event(
                 return obj.url
             return str(obj)
 
-        for key in ('event_logo_image', 'logo_image'):
+        # Only check event_logo_image - NOT logo_image (which is for header images)
+        for key in ('event_logo_image',):
             settings_logo = self.settings.get(key, default=None) or getattr(self.settings, key, None)
             path = _extract_path(settings_logo)
             if not path:
@@ -2341,7 +2452,7 @@ class Event(
     def datetime_from(self) -> dt.datetime:
         """The localised datetime of the event start date.
 
-        :rtype: datetime
+        :rtype: datetime.datetime
         """
         return make_aware(
             dt.datetime.combine(self.date_from, dt.time(hour=0, minute=0, second=0)),
@@ -2352,7 +2463,7 @@ class Event(
     def datetime_to(self) -> dt.datetime:
         """The localised datetime of the event end date.
 
-        :rtype: datetime
+        :rtype: datetime.datetime
         """
         return make_aware(
             dt.datetime.combine(self.date_to, dt.time(hour=23, minute=59, second=59)),
@@ -2390,6 +2501,17 @@ class Event(
         from eventyay.base.models import User
 
         return User.objects.filter(submissions__in=self.talks).order_by('id').distinct()
+
+    @cached_property
+    def has_schedule_content(self):
+        """Returns True if there are actual scheduled talks in the current schedule.
+
+        This checks whether the current schedule has any visible, scheduled talks
+        (not just an empty published schedule).
+        """
+        if not self.current_schedule:
+            return False
+        return self.current_schedule.scheduled_talks.exists()
 
     @cached_property
     def submitters(self):
@@ -2637,13 +2759,13 @@ class SubEvent(EventMixin, LoggedModel):
     :param name: This event's full title
     :type name: str
     :param date_from: The datetime this event starts
-    :type date_from: datetime
+    :type date_from: datetime.datetime
     :param date_to: The datetime this event ends
-    :type date_to: datetime
+    :type date_to: datetime.datetime
     :param presale_start: No tickets will be sold before this date.
-    :type presale_start: datetime
+    :type presale_start: datetime.datetime
     :param presale_end: No tickets will be sold after this date.
-    :type presale_end: datetime
+    :type presale_end: datetime.datetime
     :param location: venue
     :type location: str
     """
@@ -2843,8 +2965,8 @@ class RequiredAction(models.Model):
     Represents an action that is to be done by an admin. The admin will be
     displayed a list of actions to do.
 
-    :param datatime: The timestamp of the required action
-    :type datetime: datetime
+    :param datetime: The timestamp of the required action
+    :type datetime: datetime.datetime
     :param user: The user that performed the action
     :type user: User
     :param done: If this action has been completed or dismissed

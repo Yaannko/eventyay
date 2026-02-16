@@ -49,6 +49,14 @@ from eventyay.multidomain.urlreverse import build_absolute_uri
 from eventyay.orga.forms.widgets import HeaderSelect, MultipleLanguagesWidget
 from eventyay.plugins.banktransfer.payment import BankTransfer
 
+# Shared constants for require_registered_account_for_tickets field
+REQUIRE_REGISTERED_ACCOUNT_LABEL = _('Only allow registered accounts to get a ticket')
+REQUIRE_REGISTERED_ACCOUNT_HELP_TEXT = _(
+    'If this option is turned on, users must be logged in before completing an order. '
+    'When a user clicks "Checkout" without being logged in, they will be redirected to the login page. '
+    'The "Continue as a Guest" option will not be available for attendees in this event.'
+)
+
 
 class EventWizardFoundationForm(forms.Form):
     locales = forms.MultipleChoiceField(
@@ -147,6 +155,11 @@ class EventWizardBasicsForm(I18nModelForm):
         ),
         required=False,
     )
+    imprint_url = forms.URLField(
+        label=_('Imprint URL'),
+        help_text=_('This should point e.g. to a part of your website that has your contact details and legal information.'),
+        required=False,
+    )
 
     team = forms.ModelChoiceField(
         label=_('Grant access to team'),
@@ -173,6 +186,7 @@ class EventWizardBasicsForm(I18nModelForm):
             'location',
             'geo_lat',
             'geo_lon',
+            'email',
         ]
         field_classes = {
             'date_from': SplitDateTimeField,
@@ -202,7 +216,12 @@ class EventWizardBasicsForm(I18nModelForm):
         self.fields['locale'].choices = [(a, b) for a, b in settings.LANGUAGES if a in self.locales]
         self.fields['location'].widget.attrs['rows'] = '3'
         self.fields['location'].widget.attrs['placeholder'] = _('Sample Conference Center\nHeidelberg, Germany')
+        self.fields['geo_lat'].widget.attrs['placeholder'] = _('Latitude, e.g. 40.7128')
+        self.fields['geo_lon'].widget.attrs['placeholder'] = _('Longitude, e.g. -74.0060')
         self.fields['slug'].widget.prefix = build_absolute_uri(self.organizer, 'presale:organizer.index')
+        self.fields['email'].required = True
+        self.fields['email'].label = _('Organizer email address')
+        self.fields['email'].help_text = _("We'll show this publicly to allow attendees to contact you.")
 
         # Generate a unique slug if none provided
         if not self.initial.get('slug'):
@@ -264,6 +283,13 @@ class EventWizardBasicsForm(I18nModelForm):
         if Event.objects.filter(slug__iexact=slug, organizer=self.organizer).exists():
             raise forms.ValidationError(self.error_messages['duplicate_slug'], code='duplicate_slug')
         return slug.lower()
+
+    def clean_email(self):
+        email = self.cleaned_data.get('email', '').strip()
+        default_email = Event._meta.get_field('email').default
+        if not email or email == default_email:
+            raise forms.ValidationError(_('Please provide a valid organizer email address.'))
+        return email
 
     @staticmethod
     def has_control_rights(user, organizer):
@@ -354,11 +380,23 @@ class EventWizardDisplayForm(forms.Form):
         required=False,
         widget=HeaderSelect,
     )
+    email = forms.EmailField(
+        label=_('Organizer email address'),
+        help_text=_("We'll show this publicly to allow attendees to contact you."),
+        required=True,
+    )
 
     def __init__(self, *args, user=None, locales=None, organizer=None, **kwargs):
         super().__init__(*args, **kwargs)
         logo = Event._meta.get_field('logo')
         self.fields['logo'] = ImageField(required=False, label=logo.verbose_name, help_text=logo.help_text)
+
+    def clean_email(self):
+        email = self.cleaned_data.get('email', '').strip()
+        default_email = Event._meta.get_field('email').default
+        if not email or email == default_email:
+            raise forms.ValidationError(_('Please provide a valid organizer email address.'))
+        return email
 
 
 class EventWizardInitialForm(forms.Form):
@@ -511,7 +549,7 @@ class EventSettingsForm(SettingsForm):
     name_scheme = forms.ChoiceField(
         label=_('Name format'),
         help_text=_(
-            'This defines how pretix will ask for human names. Changing this after you already received '
+            'This defines how eventyay will ask for human names. Changing this after you already received '
             'orders might lead to unexpected behavior when sorting or changing names.'
         ),
         required=True,
@@ -556,6 +594,7 @@ class EventSettingsForm(SettingsForm):
         'event_list_available_only',
         'frontpage_text',
         'event_info_text',
+        'require_registered_account_for_tickets',
         'attendee_names_asked',
         'attendee_names_required',
         'attendee_emails_asked',
@@ -614,9 +653,10 @@ class EventSettingsForm(SettingsForm):
                 data[required_key] = True
             # Explicitly check for 'do_not_ask'.
             # Do not overwrite as default-behaviour when no value for virtual field is transmitted!
+            # Note: Only set asked to False, preserve the existing required value
             elif data[virtual_key] == 'do_not_ask':
                 data[asked_key] = False
-                data[required_key] = False
+                # Don't touch required_key - preserve existing required state
 
             # hierarkey.forms cannot handle non-existent keys in cleaned_data => do not delete, but set to None
             data[virtual_key] = None
@@ -661,7 +701,7 @@ class EventSettingsForm(SettingsForm):
             self.fields[virtual_key] = forms.ChoiceField(
                 label=asked_field.label,
                 help_text=asked_field.help_text,
-                required=True,
+                required=False,
                 widget=forms.RadioSelect,
                 choices=[
                     # default key needs a value other than '' because with '' it would also overwrite
@@ -1213,7 +1253,6 @@ class TicketSettingsForm(SettingsForm):
         'ticket_download_nonadm',
         'ticket_download_pending',
         'ticket_download_require_validated_email',
-        'require_registered_account_for_tickets',
     ]
     ticket_secret_generator = forms.ChoiceField(
         label=_('Ticket code generator'),
@@ -1221,6 +1260,11 @@ class TicketSettingsForm(SettingsForm):
         required=True,
         widget=forms.RadioSelect,
         choices=[],
+    )
+    require_registered_account_for_tickets = forms.BooleanField(
+        label=REQUIRE_REGISTERED_ACCOUNT_LABEL,
+        help_text=REQUIRE_REGISTERED_ACCOUNT_HELP_TEXT,
+        required=False,
     )
 
     def __init__(self, *args, **kwargs):
@@ -1424,18 +1468,6 @@ class QuickSetupForm(I18nForm):
         ),
         required=False,
     )
-    imprint_url = forms.URLField(
-        label=_('Imprint URL'),
-        help_text=_(
-            'This should point e.g. to a part of your website that has your contact details and legal information.'
-        ),
-        required=False,
-    )
-    contact_mail = forms.EmailField(
-        label=_('Contact address'),
-        required=False,
-        help_text=_("We'll show this publicly to allow attendees to contact you."),
-    )
     total_quota = forms.IntegerField(
         label=_('Total capacity'),
         min_value=0,
@@ -1455,16 +1487,13 @@ class QuickSetupForm(I18nForm):
         label=_('Payment by bank transfer'),
         help_text=_(
             'Your customers will be instructed to wire the money to your account. You can then import your '
-            'bank statements to process the payments within pretix, or mark them as paid manually.'
+            'bank statements to process the payments within eventyay, or mark them as paid manually.'
         ),
         required=False,
     )
     require_registered_account_for_tickets = forms.BooleanField(
-        label=_('Only allow registered accounts to get a ticket'),
-        help_text=_(
-            'If this option is turned on, only registered accounts will be allowed to purchase tickets. The '
-            "'Continue as a Guest' option will not be available for attendees."
-        ),
+        label=REQUIRE_REGISTERED_ACCOUNT_LABEL,
+        help_text=REQUIRE_REGISTERED_ACCOUNT_HELP_TEXT,
         required=False,
     )
     btf = BankTransfer.form_fields()

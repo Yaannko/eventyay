@@ -1,9 +1,6 @@
 eventyay-tickets (ENext)
 ========================
 
-.. image:: https://codecov.io/gh/fossasia/eventyay-tickets/branch/dev/graph/badge.svg
-  :target: https://codecov.io/gh/pretix/pretix
-
 Project status & release cycle
 ------------------------------
 
@@ -138,6 +135,9 @@ In case you cannot take advantage of PostgreSQL *peer* mode, you need to create 
 
   python manage.py runserver
 
+Mobile testing note: If you want to test the site from an **Android emulator**, use
+``http://10.0.2.2:8000/`` (Android's alias for the host machine's localhost).
+
 
 Notes: If you get permission errors for eventyay/static/CACHE, make sure that the directory and
 all below it are own by you.
@@ -166,7 +166,7 @@ We assume your current working directory is the checkout of this repo.
 
    .. code-block:: bash
 
-  docker volume rm eventyay_postgres_data_dev eventyay_static_volume
+      docker volume rm eventyay_postgres_data_dev eventyay_static_volume
 
 4. **Build and run the images**
 
@@ -174,7 +174,14 @@ We assume your current working directory is the checkout of this repo.
 
       docker compose up -d --build
 
-5. **Create a superuser account** (for accessing the admin panel):
+5. **Run database migrations**:
+
+  .. code-block:: bash
+
+      docker exec -ti eventyay-next-web python manage.py makemigrations
+      docker exec -ti eventyay-next-web python manage.py migrate
+
+6. **Create a superuser account** (for accessing the admin panel):
 
    This should be necessary only once, since the database is persisted
    as docker volume. If you see strange behaviour, see the point 3.
@@ -182,26 +189,51 @@ We assume your current working directory is the checkout of this repo.
 
   .. code-block:: bash
 
-  docker exec -ti eventyay-next-web python manage.py createsuperuser
+      docker exec -ti eventyay-next-web python manage.py createsuperuser
 
-6. **Visit the site**
+7. **Visit the site**
 
   Open `http://localhost:8000` in a browser.
 
-7. **Checking the logs**
+8. **Troubleshooting: CSS not loading / MIME type errors**
+
+   In some environments (e.g. Docker with WSL), you may encounter cases where
+   pages load without CSS or only some pages load correctly.
+
+   Browser console errors may look like:
+
+   ::
+
+     Refused to apply style because its MIME type is 'text/html'
+
+   This usually means a static asset was requested but an HTML response
+   (e.g. a 404 page) was returned instead.
+
+   To rebuild static assets, run:
+
+   .. code-block:: bash
+
+      docker exec -ti eventyay-next-web python manage.py collectstatic --noinput
+      docker exec -ti eventyay-next-web python manage.py compress --force
+      docker restart eventyay-next-web
+
+   After this, hard-refresh the browser (Ctrl + Shift + R).
+
+
+9. **Checking the logs**
 
   .. code-block:: bash
 
-  docker compose logs -f
+      docker compose logs -f
 
 
-8. **Shut down**
+10. **Shut down**
 
    To shut down the development docker deployment, run
 
   .. code-block:: bash
 
-  docker compose down
+      docker compose down
 
 The directory `app/eventyay` is mounted into the docker, thus live editing is supported.
 
@@ -262,25 +294,27 @@ Due to this reason, overriding configuration via environment variables are not e
 Deployment
 ----------
 
-* copy all of the `deployment` directory onto the server into <TARGET_DIR> (eg. as `/home/fossasia/enext`)
-* prepare the used volumes in docker-compose: 
-        <TARGET_DIR>/data/static
-        <TARGET_DIR>/data/postgres
-        <TARGET_DIR>/data/data
-  and
-        chown 100:101 <TARGET_DIR>/data/data
-        chmod a+x <TARGET_DIR>/data/static
-* copy `env.sample` to `.env` in `/home/fossasia/enext`, and edit it:
-  - replace <SERVER_NAME> with your server, like next.eventyay.com
-  - all the CHANGEME entries
-* copy `nginx/enext-direct` to your system `/etc/nginx/sites-available` and edit it:
-  - replace <SERVER_NAME> with your server, like `next.eventyay.com`
-  - replace <PATH_TO> with the <TARGET_DIR> you choose, like `/home/fossasia/enext`
-  The file needs to be adjusted if the `enext` dir is NOT in `/home/fossasia`!
-* Link the `enext-direct` file into `/etc/nginx/sites-enabled`
-* Restart nginx
-* Run
-        docker compose up -d
+See DEPLOYMENT.md
+
+
+Future improvement
+------------------
+
+Backend
+~~~~~~~
+
+- Apply type annotation for Python and MyPy (or ty) checking. Benefit: It improves IDE autocomplete and detect some bugs early.
+- Use Jinja for templating (replacing Django template).
+  Benefit: We can embed Python function to template and call. With Django template, we have to define filter, custom tags.
+- Use djlint (or a better tool) to clean template code.
+
+Frontend
+~~~~~~~~
+
+- Get rid of jQuery code, convert them to Vue or AlpineJS.
+- Consider two options:
+  +  Migrating to a Single Page Application, where we can use the full power of Vue and can apply TypeScript to improve IDE autocomplete and detect bugs early.
+  +  HTMX + AlpineJS if we still want Django to produce HTML.
 
 
 Support
@@ -288,21 +322,22 @@ Support
 
 This project is **free and open-source software**. Professional support is available to customers of the **hosted Eventyay service** or **Eventyay enterprise offerings**. If you are interested in commercial support, hosting services, or supporting this project financially, please go to `eventyay.com`.
 
-Contributing
-------------
+Legal & Licensing
+-----------------
 
-Please look through our issues and start contributing.
+**License**: This project is published under the **Apache License 2.0**.
+See the `LICENSE <LICENSE>`_ file for complete license text.
 
-License
--------
+**Attribution**: See the `NOTICE <NOTICE>`_ file for information about upstream
+projects and attribution.
 
-The code in this repository is published under the terms of the **Apache 2 License**.
-See the LICENSE file for the complete license text.
+**Contributing**: Contributions are accepted under the Apache License 2.0.
+See `CONTRIBUTING.md <CONTRIBUTING.md>`_ and `CLA.md <CLA.md>`_ for details.
 
-This project is maintained by **FOSSASIA**. See the AUTHORS file for a list of all the awesome contributors of this project.
+This project is maintained by **FOSSASIA**.
 
 .. _uv: https://docs.astral.sh/uv/getting-started/installation/
+.. _Docker secrets: https://docs.docker.com/engine/swarm/secrets/
 .. _installation guide: https://docs.eventyay.com/en/latest/admin/installation/index.html
 .. _eventyay.com: https://eventyay.com
 .. _blog: https://blog.eventyay.com
-.. _Docker secrets: https://docs.docker.com/engine/swarm/secrets/
